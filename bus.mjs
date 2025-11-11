@@ -296,6 +296,153 @@ bot.onText(/\/bus/, async (msg) => {
   }
 });
 
+// ===== /next - Get buses available in the next hour with predicted IDs =====
+bot.onText(/\/next/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!savedToken) {
+    bot.sendMessage(chatId, "❌ No token found! Please use `/get` to retrieve your token.", { parse_mode: "Markdown" });
+    return;
+  }
+
+  try {
+    log(`🌐 /next request from user ${chatId}`, "info");
+    bot.sendMessage(chatId, "🔍 Checking upcoming buses...");
+
+    // Fetch current buses to get the last ID
+    const currentRes = await fetch("https://bus-med.1337.ma/api/departure/current", {
+      headers: {
+        "Cookie": `le_token=${savedToken}`,
+        "Accept": "application/json",
+      },
+    });
+
+    let lastBusId = null;
+    if (currentRes.ok) {
+      const currentBuses = await currentRes.json();
+      if (Array.isArray(currentBuses) && currentBuses.length > 0) {
+        // Find the maximum ID from current buses
+        lastBusId = Math.max(...currentBuses.map(b => b.id));
+        log(`🔢 Last available bus ID: ${lastBusId}`, "info");
+      }
+    }
+
+    // Fetch upcoming buses
+    const res = await fetch("https://bus-med.1337.ma/api/departure/upcoming", {
+      headers: {
+        "Cookie": `le_token=${savedToken}`,
+        "Accept": "application/json",
+      },
+    });
+
+    const statusText = `${res.status} ${res.statusText}`;
+    log(`🌐 /next request returned ${statusText}`, res.ok ? "success" : "error");
+
+    if (res.status === 401) {
+      bot.sendMessage(chatId, "🚫 Unauthorized — your token might be expired. Use `/get` to refresh it.", { parse_mode: "Markdown" });
+      return;
+    }
+
+    const allBuses = await res.json();
+    if (!Array.isArray(allBuses) || allBuses.length === 0) {
+      bot.sendMessage(chatId, "🚌 No upcoming buses found.");
+      return;
+    }
+
+    // Get current time
+    const now = new Date();
+    const currentHour = now.getHours();
+    const currentMinute = now.getMinutes();
+    const currentSecond = now.getSeconds();
+    const currentTimeInSeconds = currentHour * 3600 + currentMinute * 60 + currentSecond;
+    
+    // Calculate one hour from now
+    const oneHourLater = currentTimeInSeconds + 3600;
+
+    log(`⏰ Current time: ${String(currentHour).padStart(2, '0')}:${String(currentMinute).padStart(2, '0')}:${String(currentSecond).padStart(2, '0')}`, "info");
+
+    // Filter buses available within the next hour
+    const nextHourBuses = allBuses.filter(bus => {
+      const [availHour, availMinute, availSecond] = bus.available_time.split(':').map(Number);
+      const availableTimeInSeconds = availHour * 3600 + availMinute * 60 + availSecond;
+      
+      // Check if available time is within the next hour
+      return availableTimeInSeconds > currentTimeInSeconds && availableTimeInSeconds <= oneHourLater;
+    });
+
+    if (nextHourBuses.length === 0) {
+      bot.sendMessage(chatId, "⏰ No buses available in the next hour.\n\nTip: Use `/bus` to see current buses.");
+      log("📭 No buses found in the next hour", "warn");
+      return;
+    }
+
+    // Sort buses by available_time, then by bus.id to ensure correct order
+    nextHourBuses.sort((a, b) => {
+      const timeCompare = a.available_time.localeCompare(b.available_time);
+      if (timeCompare !== 0) return timeCompare;
+      return a.bus.id - b.bus.id;
+    });
+
+    // Generate predicted IDs based on last bus ID and bus order
+    const busesWithPredictedIds = nextHourBuses.map((bus, index) => {
+      let predictedId = null;
+      
+      if (lastBusId !== null) {
+        // Group by available_time to handle multiple buses at same time
+        const sameTimeIndex = nextHourBuses
+          .filter(b => b.available_time === bus.available_time)
+          .findIndex(b => b.bus.id === bus.bus.id);
+        
+        // Calculate predicted ID: lastBusId + offset based on position
+        const baseOffset = nextHourBuses
+          .slice(0, index)
+          .filter(b => b.available_time !== bus.available_time).length;
+        
+        predictedId = lastBusId + baseOffset + sameTimeIndex + 1;
+      }
+
+      return {
+        ...bus,
+        predictedId
+      };
+    });
+
+    // Build response message
+    let response = `🕐 *Buses available in the next hour:*\n\n`;
+    
+    for (const bus of busesWithPredictedIds) {
+      const availTime = bus.available_time.substring(0, 5); // HH:MM
+      const deptTime = bus.departure_time.substring(0, 5);  // HH:MM
+      const noReturn = bus.no_return ? " 🚫 (No Return)" : "";
+      const idDisplay = bus.predictedId ? `~${bus.predictedId}` : "???";
+      
+      response += `🔹 *Predicted ID:* \`${idDisplay}\`\n`;
+      response += `   📍 Route: ${bus.name}${noReturn}\n`;
+      response += `   🚍 Bus: ${bus.bus.name}\n`;
+      response += `   ⏰ Available: ${availTime}\n`;
+      response += `   🚀 Departs: ${deptTime}\n\n`;
+    }
+
+    response += `💡 *Tip:* Use \`id: ${busesWithPredictedIds[0].predictedId || '???'}\` to set your bus ID\n`;
+    response += `📝 *Note:* IDs marked with ~ are predicted based on the last available bus`;
+
+    bot.sendMessage(chatId, response, { parse_mode: "Markdown" });
+    log(`✅ Found ${nextHourBuses.length} bus(es) in the next hour for user ${chatId}`, "success");
+    
+    if (lastBusId) {
+      log(`🔮 Predicted IDs starting from ${lastBusId + 1}`, "info");
+    } else {
+      log(`⚠️ Could not determine last bus ID - prediction unavailable`, "warn");
+    }
+    
+    // Log to file
+    fs.appendFileSync(LOG_FILE, `[${now.toLocaleString()}] /next request by ${chatId} → Found ${nextHourBuses.length} bus(es), Last ID: ${lastBusId || 'unknown'}\n`);
+
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Error fetching upcoming buses: ${err.message}`);
+    log(`❌ /next error: ${err.message}`, "error");
+  }
+});
+
 // ===== Handle messages =====
 bot.on("message", (msg) => {
   const chatId = msg.chat.id;
